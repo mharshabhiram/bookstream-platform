@@ -1,0 +1,183 @@
+version: "3.8"
+
+services:
+  # ─── PostgreSQL ──────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: bookstream-postgres
+    environment:
+      POSTGRES_USER: bookstream
+      POSTGRES_PASSWORD: bookstream
+      POSTGRES_DB: bookstream
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bookstream"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - bookstream
+
+  # ─── Redis ───────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: bookstream-redis
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - bookstream
+
+  # ─── MinIO (S3-compatible storage) ───────────────────────────
+  minio:
+    image: minio/minio:latest
+    container_name: bookstream-minio
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - bookstream
+
+  # ─── API Backend ───────────────────────────────────────────────
+  api:
+    build:
+      context: ../../apps/api
+      dockerfile: Dockerfile
+    container_name: bookstream-api
+    environment:
+      APP_ENV: development
+      APP_DEBUG: "true"
+      DATABASE_URL: postgresql+asyncpg://bookstream:bookstream@postgres:5432/bookstream
+      REDIS_URL: redis://redis:6379/0
+      REDIS_CACHE_URL: redis://redis:6379/1
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-dev-secret-change-in-production}
+      STORAGE_TYPE: local
+      CELERY_BROKER_URL: redis://redis:6379/2
+      CELERY_RESULT_BACKEND: redis://redis:6379/3
+      CORS_ORIGINS: http://localhost:3000
+    volumes:
+      - ./apps/api/src:/app/src:ro
+      - api_uploads:/app/uploads
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - bookstream
+    restart: unless-stopped
+
+  # ─── Celery Worker ───────────────────────────────────────────
+  celery:
+    build:
+      context: ../../apps/api
+      dockerfile: Dockerfile
+    container_name: bookstream-celery
+    command: celery -A src.workers.celery_app worker --loglevel=info --concurrency=4
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql+asyncpg://bookstream:bookstream@postgres:5432/bookstream
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/2
+      CELERY_RESULT_BACKEND: redis://redis:6379/3
+    volumes:
+      - ./apps/api/src:/app/src:ro
+      - api_uploads:/app/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - bookstream
+    restart: unless-stopped
+
+  # ─── Celery Beat (Scheduler) ─────────────────────────────────
+  celery-beat:
+    build:
+      context: ../../apps/api
+      dockerfile: Dockerfile
+    container_name: bookstream-celery-beat
+    command: celery -A src.workers.celery_app beat --loglevel=info
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql+asyncpg://bookstream:bookstream@postgres:5432/bookstream
+      CELERY_BROKER_URL: redis://redis:6379/2
+      CELERY_RESULT_BACKEND: redis://redis:6379/3
+    volumes:
+      - ./apps/api/src:/app/src:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - bookstream
+    restart: unless-stopped
+
+  # ─── Next.js Frontend ────────────────────────────────────────
+  web:
+    build:
+      context: ../../apps/web
+      dockerfile: Dockerfile
+    container_name: bookstream-web
+    environment:
+      NODE_ENV: production
+      NEXT_PUBLIC_API_URL: http://api:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+    networks:
+      - bookstream
+    restart: unless-stopped
+
+  # ─── Nginx Reverse Proxy ─────────────────────────────────────
+  nginx:
+    image: nginx:alpine
+    container_name: bookstream-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./infra/nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - web
+      - api
+    networks:
+      - bookstream
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:
+  api_uploads:
+
+networks:
+  bookstream:
+    driver: bridge
